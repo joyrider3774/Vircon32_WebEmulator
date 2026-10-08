@@ -15,14 +15,44 @@
     #include "SDL.h"            // [ SDL2 ] Main header
     
     // include OpenGL headers
-    #include <glad/glad.h>      // [ OpenGL ] GLAD Loader (already includes <GL/gl.h>)
+    #if defined(__EMSCRIPTEN__)
+      // Targets ES2/WebGL1 rather than ES3/WebGL2: WebGL2 support is
+      // markedly less mature in WebKit-based browsers (Safari, GNOME Web)
+      // than WebGL1, and has been reported to cause flickering/black
+      // screens there. The handful of ES3-only calls this file used
+      // (VAOs, glBlitFramebuffer, glDrawBuffers, sized texture formats)
+      // are guarded out under __EMSCRIPTEN__ elsewhere in VideoOutput.cpp
+      // with ES2-compatible equivalents - see CreateFramebuffer(),
+      // CompileShaderProgram(), and DrawFramebufferOnScreen().
+      #include <GLES2/gl2.h>    // [ OpenGL ] WebGL1-compatible GLES2 headers (Emscripten provides the symbols directly, no loader needed)
+    #else
+      #include <glad/glad.h>      // [ OpenGL ] GLAD Loader (already includes <GL/gl.h>)
+    #endif
 // *****************************************************************************
 
 
 // we will render our quads in groups using a
 // fixed size queue; this parameter sets the
 // queue size and acts as group size limit
-#define QUAD_QUEUE_SIZE 20
+//
+// Bigger under Emscripten specifically: every GL call here has to cross
+// from compiled WASM into JS (WebGL only exists as a browser/JS API),
+// and that crossing has real per-call overhead native desktop GL never
+// pays - confirmed via CPU profiling, where the dominant cost during a
+// real slowdown was Emscripten's JS/WASM call-boundary machinery itself
+// (getWasmTableEntry, wasm-to-js, js-to-wasm), not game logic or GPU
+// shader time. SelectTexture()/SetMultiplyColor()/SetBlendingMode() all
+// force a flush on any state change regardless of queue size, so this
+// only helps runs of same-texture quads longer than the old limit of 20 -
+// it can't help texture-switch-forced flushes - but it's a strictly safe
+// change either way: it only ever reduces how many separate draw calls a
+// long same-texture run takes, never what ends up on screen. Memory cost
+// is trivial even at this size (a few KB of vertex/index data).
+#if defined(__EMSCRIPTEN__)
+  #define QUAD_QUEUE_SIZE 512
+#else
+  #define QUAD_QUEUE_SIZE 20
+#endif
 
 
 // =============================================================================

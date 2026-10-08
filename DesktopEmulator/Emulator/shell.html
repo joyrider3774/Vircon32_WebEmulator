@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+    <title>Vircon32</title>
+    <style>
+      /* Designed for embedding in a small iframe on a game page (itch.io
+         and similar) - fills whatever box it's given, keeps the console's
+         native 640x360 (16:9) aspect ratio via letterboxing rather than
+         stretching, and has no developer-facing controls (no "resize
+         canvas"/"lock pointer" checkboxes, no output textarea) - just the
+         screen and a minimal loading/start overlay. */
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+
+      #stage {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      /* This is the element that actually gets fullscreened. Deliberately
+         has no max-width/max-height/aspect-ratio of its own: Chromium's
+         (and other browsers') UA stylesheet forces width/height to 100%
+         on whatever element is the fullscreen target and overrides any
+         author max-width/max-height on it - so those constraints have to
+         live one level down instead (#viewport below), on an element that
+         fullscreen mode never touches. */
+      #console-frame {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      /* The actual 640x360 (16:9) letterboxed box - constrained here,
+         one level below the fullscreen target, so the browser's fullscreen
+         styling can't override it. */
+      #viewport {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        max-width: calc(100vh * 16 / 9);
+        max-height: calc(100vw * 9 / 16);
+        aspect-ratio: 16 / 9;
+      }
+
+      #canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+        background: #000;
+        /* keep pixel art crisp when the canvas is scaled up by CSS,
+           rather than blurred by the browser's default bilinear scaling */
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+
+      #overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75em;
+        background: rgba(0, 0, 0, 0.85);
+        color: #eee;
+        font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: center;
+      }
+
+      #overlay.hidden {
+        display: none;
+      }
+
+      .spinner {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        border: 4px solid rgba(255, 255, 255, 0.25);
+        border-top-color: #eee;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+
+      #progress {
+        width: 60%;
+        max-width: 220px;
+        accent-color: #eee;
+      }
+
+      #fullscreen-button {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        z-index: 2;
+        opacity: 0.6;
+        background: rgba(0, 0, 0, 0.5);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        color: #eee;
+        border-radius: 4px;
+        padding: 0.3em 0.6em;
+        font-size: 0.8em;
+        cursor: pointer;
+      }
+
+      #fullscreen-button:hover {
+        opacity: 1;
+      }
+
+      #bottom-left-bar {
+        position: absolute;
+        left: 8px;
+        bottom: 8px;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      #fps-counter {
+        opacity: 0.6;
+        background: rgba(0, 0, 0, 0.5);
+        color: #eee;
+        border-radius: 4px;
+        padding: 0.3em 0.6em;
+        font: 0.8em/1 monospace;
+        pointer-events: none;
+      }
+
+      /* CPU/GPU load overlay - same two figures as the native desktop
+         build's own ImGui panel (V32Console::GetCPULoad()/GetGPULoad(),
+         pushed from MainWeb.cpp's WebMainLoopStep() once per real frame),
+         just rendered as plain HTML/canvas here since this build has no
+         ImGui. Top-left, out of the way of the FPS counter/fullscreen
+         button which already live bottom-left/bottom-right. */
+      #perf-overlay {
+        position: absolute;
+        left: 8px;
+        top: 8px;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        opacity: 0.75;
+        background: rgba(0, 0, 0, 0.5);
+        border-radius: 4px;
+        padding: 0.35em 0.5em;
+        font: 0.75em/1.3 monospace;
+        color: #eee;
+        pointer-events: none;
+      }
+
+      /* Same `.hidden` class convention as #overlay/#info-overlay above,
+         not the plain `hidden` attribute - this element's own `display:
+         flex` rule would otherwise win over the attribute's UA-stylesheet
+         `display: none` default (author CSS beats the built-in [hidden]
+         rule whenever it sets `display` explicitly), so the attribute
+         alone silently failed to hide it. */
+      #perf-overlay.hidden {
+        display: none;
+      }
+
+      #perf-overlay .perf-row {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+
+      #perf-overlay .perf-label {
+        width: 2.2em;
+      }
+
+      #perf-overlay canvas {
+        display: block;
+        image-rendering: pixelated;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      #info-button {
+        opacity: 0.6;
+        background: rgba(0, 0, 0, 0.5);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        color: #eee;
+        border-radius: 50%;
+        width: 1.6em;
+        height: 1.6em;
+        line-height: 1.6em;
+        text-align: center;
+        padding: 0;
+        font: bold 0.8em/1.6em -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+      }
+
+      #info-button:hover {
+        opacity: 1;
+      }
+
+      #info-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.7);
+      }
+
+      #info-overlay.hidden {
+        display: none;
+      }
+
+      #info-panel {
+        position: relative;
+        max-width: 80%;
+        max-height: 80%;
+        overflow: auto;
+        background: #222;
+        color: #eee;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        border-radius: 6px;
+        padding: 1em 1.4em;
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      #info-panel h2 {
+        margin: 0 0 0.4em;
+        font-size: 1.1em;
+      }
+
+      #info-panel a {
+        color: #6cf;
+      }
+
+      #info-panel table {
+        border-collapse: collapse;
+        margin-top: 0.3em;
+      }
+
+      #info-panel td {
+        padding: 0.1em 0.6em 0.1em 0;
+        white-space: nowrap;
+      }
+
+      #info-panel td:first-child {
+        color: #6cf;
+        font-family: monospace;
+      }
+
+      #info-close-button {
+        position: absolute;
+        top: 0.4em;
+        right: 0.5em;
+        background: none;
+        border: none;
+        color: #eee;
+        font-size: 1.1em;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.7;
+      }
+
+      #info-close-button:hover {
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <div id="console-frame">
+        <div id="viewport">
+          <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+
+          <div id="overlay">
+            <div id="loading-state">
+              <div class="spinner"></div>
+              <div id="status">Loading&hellip;</div>
+              <progress id="progress" value="0" max="100" hidden></progress>
+            </div>
+          </div>
+
+          <div id="info-overlay" class="hidden">
+            <div id="info-panel">
+              <button id="info-close-button" aria-label="Close">&times;</button>
+              <h2>Vircon32</h2>
+              <p>Vircon32 and this emulator were created by Carra.<br>
+                 <a href="https://www.vircon32.com" target="_blank" rel="noopener">www.vircon32.com</a></p>
+              <h2>Controls</h2>
+              <table>
+                <tr><td>Arrow keys</td><td>D-pad</td></tr>
+                <tr><td>X</td><td>Button A</td></tr>
+                <tr><td>Z</td><td>Button B</td></tr>
+                <tr><td>S</td><td>Button X</td></tr>
+                <tr><td>A</td><td>Button Y</td></tr>
+                <tr><td>Q</td><td>Button L</td></tr>
+                <tr><td>W</td><td>Button R</td></tr>
+                <tr><td>Enter</td><td>Start</td></tr>
+              </table>
+            </div>
+          </div>
+
+          <div id="perf-overlay" class="hidden">
+            <div class="perf-row">
+              <span class="perf-label">CPU</span>
+              <canvas id="cpu-graph" width="80" height="16"></canvas>
+              <span id="cpu-text">--%</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">GPU</span>
+              <canvas id="gpu-graph" width="80" height="16"></canvas>
+              <span id="gpu-text">--%</span>
+            </div>
+          </div>
+
+          <button id="fullscreen-button" hidden>&#x26F6; Fullscreen</button>
+          <div id="bottom-left-bar" hidden>
+            <div id="fps-counter">FPS: --</div>
+            <button id="info-button" aria-label="Info">i</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="text/javascript">
+      var canvasElement = document.getElementById('canvas');
+      var overlayElement = document.getElementById('overlay');
+      var loadingStateElement = document.getElementById('loading-state');
+      var statusElement = document.getElementById('status');
+      var progressElement = document.getElementById('progress');
+      var fullscreenButton = document.getElementById('fullscreen-button');
+      var bottomLeftBar = document.getElementById('bottom-left-bar');
+      var fpsCounterElement = document.getElementById('fps-counter');
+      var perfOverlay = document.getElementById('perf-overlay');
+      var cpuTextElement = document.getElementById('cpu-text');
+      var gpuTextElement = document.getElementById('gpu-text');
+      var cpuGraphCanvas = document.getElementById('cpu-graph');
+      var gpuGraphCanvas = document.getElementById('gpu-graph');
+      var infoButton = document.getElementById('info-button');
+      var infoOverlay = document.getElementById('info-overlay');
+      var infoCloseButton = document.getElementById('info-close-button');
+
+      canvasElement.addEventListener('webglcontextlost', function (e) {
+        e.preventDefault();
+        setStatus('WebGL context lost - please reload the page');
+        overlayElement.classList.remove('hidden');
+      }, false);
+
+      function setStatus(text) {
+        statusElement.textContent = text;
+      }
+
+      // Arrow keys stopped reaching the emulator's gamepad in Safari
+      // specifically (regular mapped keys like A/X were unaffected).
+      // Emscripten's SDL2 keyboard handling listens on window; whatever
+      // Safari does differently with arrow keys along the canvas->window
+      // bubble path (they're the one class of key with a default browser
+      // action - scroll/navigation - to interact with) meant it apparently
+      // never got there, at least not intact. Intercepting on the canvas,
+      // stopping the original event completely, and re-dispatching a fresh
+      // synthetic KeyboardEvent directly on window sidesteps whatever that
+      // interference is, rather than depending on it not happening.
+      ['keydown', 'keyup'].forEach(function (type) {
+        canvasElement.addEventListener(type, function (e) {
+          if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            window.dispatchEvent(new KeyboardEvent(type, {
+              key: e.key,
+              code: e.code,
+              keyCode: e.keyCode,
+              which: e.which,
+              bubbles: true,
+              cancelable: true,
+            }));
+          }
+        });
+      });
+
+      // Once the wasm module (and our preloaded ROM) are ready, hide the
+      // loading overlay and focus the canvas automatically - no "click to
+      // start" step. Audio still won't play until the browser sees a real
+      // user gesture (its autoplay policy, not something this page
+      // controls), but that happens naturally the moment someone presses a
+      // direction/button key to actually play.
+      function startRunning() {
+        overlayElement.classList.add('hidden');
+        canvasElement.focus();
+        fullscreenButton.hidden = false;
+        bottomLeftBar.hidden = false;
+        // perf-overlay deliberately NOT shown here - hidden by default,
+        // toggled with F6 (see the keydown listener below). Most players
+        // never need it; it's a debugging/profiling aid.
+        requestAnimationFrame(fpsCounterTick);
+      }
+
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'F6') {
+          e.preventDefault();
+          perfOverlay.classList.toggle('hidden');
+        }
+      });
+
+      // CPU/GPU load graphs: a small scrolling history (one column per
+      // sample, oldest at the left) matching the native desktop build's
+      // own ImGui performance overlay in spirit, redrawn from scratch each
+      // update rather than actually scrolling pixels - simpler, and cheap
+      // enough at this size/rate (one call per real emulator frame, from
+      // Module.onPerfUpdate below).
+      var MAX_PERF_SAMPLES = 80;
+      var cpuHistory = [];
+      var gpuHistory = [];
+
+      function loadColor(percent) {
+        if (percent >= 90) return '#e55';
+        if (percent >= 70) return '#eb5';
+        return '#5c5';
+      }
+
+      function drawLoadGraph(canvas, history) {
+        var ctx = canvas.getContext('2d');
+        var w = canvas.width, h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+
+        var barWidth = w / MAX_PERF_SAMPLES;
+        for (var i = 0; i < history.length; i++) {
+          var percent = history[i];
+          var barHeight = Math.max(1, Math.round((percent / 100) * h));
+          ctx.fillStyle = loadColor(percent);
+          ctx.fillRect(
+            Math.round(i * barWidth), h - barHeight,
+            Math.max(1, Math.round(barWidth)), barHeight
+          );
+        }
+      }
+
+      function pushSample(history, percent) {
+        history.push(percent);
+        if (history.length > MAX_PERF_SAMPLES)
+          history.shift();
+      }
+
+      // Small (i) popup with author/site credit and the default keyboard
+      // controls - there is no in-game way to see these otherwise, since
+      // this port has no controls editor/settings UI at all (see Readme.md).
+      function openInfo() {
+        infoOverlay.classList.remove('hidden');
+      }
+
+      function closeInfo() {
+        infoOverlay.classList.add('hidden');
+        canvasElement.focus();
+      }
+
+      infoButton.addEventListener('click', openInfo);
+      infoCloseButton.addEventListener('click', closeInfo);
+
+      infoOverlay.addEventListener('click', function (e) {
+        if (e.target === infoOverlay)
+          closeInfo();
+      });
+
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !infoOverlay.classList.contains('hidden'))
+          closeInfo();
+      });
+
+      // Measures the actual browser rendering rate (via requestAnimationFrame,
+      // the same clock emscripten_set_main_loop's callback runs on) rather
+      // than anything reported from inside the emulator - this is
+      // deliberately a completely separate rAF loop, with no dependency on
+      // Module/WASM internals, so it keeps working even if the emulator's
+      // own loop stalls (which is exactly the scenario worth being able to
+      // see - e.g. the frame catch-up spiral described in the porting log).
+      var fpsFrameCount = 0;
+      var fpsLastUpdateTime = 0;
+
+      function fpsCounterTick(now) {
+        fpsFrameCount++;
+
+        if (now - fpsLastUpdateTime >= 500) {
+          var fps = (fpsFrameCount * 1000) / (now - fpsLastUpdateTime);
+          fpsCounterElement.textContent = 'FPS: ' + fps.toFixed(0);
+          fpsFrameCount = 0;
+          fpsLastUpdateTime = now;
+        }
+
+        requestAnimationFrame(fpsCounterTick);
+      }
+
+      // Deliberately not using Emscripten's Module.requestFullscreen()
+      // helper: its "resize canvas" mode changes the canvas element's
+      // actual backing-store resolution on fullscreen enter/exit, but the
+      // C++ side's GL viewport (VideoOutput::WindowWidth/WindowHeight) is
+      // only ever set once at startup and has no resize handling to keep
+      // it in sync - so the backing store and the viewport it draws into
+      // would go out of sync, leaving a blank canvas. Instead, fullscreen
+      // the wrapper element with the standard API and let the existing
+      // CSS scaling (which already works for the normal, non-fullscreen
+      // case) do the same job at a bigger size - the canvas's actual
+      // resolution never changes either way.
+      var consoleFrame = document.getElementById('console-frame');
+
+      fullscreenButton.addEventListener('click', function () {
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else {
+          consoleFrame.requestFullscreen().catch(function (err) {
+            console.error('Fullscreen request failed:', err);
+          });
+        }
+      });
+
+      document.addEventListener('fullscreenchange', function () {
+        fullscreenButton.textContent = document.fullscreenElement
+          ? '⛶ Exit fullscreen'
+          : '⛶ Fullscreen';
+        canvasElement.focus();
+      });
+
+      var Module = {
+        canvas: canvasElement,
+        setStatus: setStatus,
+        totalDependencies: 0,
+        monitorRunDependencies: function (left) {
+          this.totalDependencies = Math.max(this.totalDependencies, left);
+
+          if (left) {
+            var done = this.totalDependencies - left;
+            progressElement.hidden = false;
+            progressElement.value = done;
+            progressElement.max = this.totalDependencies;
+            setStatus('Loading… (' + done + '/' + this.totalDependencies + ')');
+          } else {
+            progressElement.hidden = true;
+            startRunning();
+          }
+        },
+      };
+
+      // Called directly from MainWeb.cpp's WebMainLoopStep(), once per
+      // real emulator frame while the console is powered on - see that
+      // file's own comment for exactly which figures these are
+      // (V32Console::GetCPULoad()/GetGPULoad(), each 0-100). Must be
+      // assigned after `Module` itself exists (this used to sit earlier in
+      // the script, before the `var Module = {...}` below - since `var` is
+      // only hoisted as a declaration, not its assignment, `Module` was
+      // still undefined at that point and this threw, aborting the rest of
+      // this script block before Emscripten's own runtime handoff ever
+      // ran - the actual cause of the cartridge failing to load at all).
+      Module.onPerfUpdate = function (cpuPercent, gpuPercent) {
+        pushSample(cpuHistory, cpuPercent);
+        pushSample(gpuHistory, gpuPercent);
+
+        cpuTextElement.textContent = cpuPercent.toFixed(0) + '%';
+        gpuTextElement.textContent = gpuPercent.toFixed(0) + '%';
+        cpuTextElement.style.color = loadColor(cpuPercent);
+        gpuTextElement.style.color = loadColor(gpuPercent);
+
+        if (!perfOverlay.classList.contains('hidden')) {
+          drawLoadGraph(cpuGraphCanvas, cpuHistory);
+          drawLoadGraph(gpuGraphCanvas, gpuHistory);
+        }
+      };
+
+      setStatus('Loading…');
+
+      window.onerror = window.onunhandledrejection = function () {
+        setStatus('Something went wrong - see the browser console for details');
+        overlayElement.classList.remove('hidden');
+      };
+    </script>
+    {{{ SCRIPT }}}
+  </body>
+</html>

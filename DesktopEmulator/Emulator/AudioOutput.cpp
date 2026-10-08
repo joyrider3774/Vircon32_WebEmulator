@@ -250,7 +250,27 @@ bool AudioOutput::QueueNextBuffer()
 {
     // console sound output is ignored when muted
     if( Mute ) return true;
-    
+
+    // Throttle how far the queue is allowed to grow ahead of real-time
+    // playback. SDL_QueueAudio() (below) has no backpressure of its own -
+    // without this check, this function unconditionally pushes one more
+    // frame's audio onto the queue every single call, regardless of
+    // whether the audio device has actually drained previous buffers yet.
+    // Any persistent mismatch - even a tiny one - between the emulator's
+    // frame clock and the real audio playback clock then lets the queue
+    // grow completely unbounded over a play session; this is far more
+    // likely under Emscripten's ScriptProcessorNode-based SDL2 audio
+    // backend than on desktop's native ones, and managing an
+    // ever-growing queue gets progressively more expensive - exactly the
+    // shape of "runs fine at first, visibly degrades over time" slowdown
+    // this fixes. This only ever discards audio frames, never video ones
+    // - the emulator's own frame stepping (MainWeb.cpp) is untouched.
+    Uint32 QueuedBytes = SDL_GetQueuedAudioSize( AudioDeviceID );
+    Uint32 MaxQueuedBytes = (Uint32)MAX_LATENCY_FRAMES * (Uint32)sizeof( PlaybackBuffer.Samples );
+
+    if( QueuedBytes > MaxQueuedBytes )
+      return true;
+
     // obtain sound output for the current frame
     Console.GetFrameSoundOutput( PlaybackBuffer );
     

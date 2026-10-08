@@ -59,10 +59,10 @@ namespace V32
         // check that the normal RAM write is successful
         if( !V32RAM::WriteAddress( LocalAddress, Value ) )
           return false;
-        
+
         // data is now pending to save
         PendingSave = true;
-        
+
         return true;
     }
 }
